@@ -1,4 +1,4 @@
-; FLS-PLUS (Files Plus) v1.0
+; FLS-PLUS (Files Plus) v1.1
 ; Поддержка кодировок: UTF-8, CP1251
 ; Формат снимка: === путь | кодировка ===
 #Requires AutoHotkey v2.0
@@ -6,11 +6,13 @@
 
 ; === КОНСТАНТЫ ===
 APP_NAME := "FLS-PLUS"
-APP_VERSION := "1.0"
+APP_VERSION := "1.1"
 iniFile := A_ScriptDir "\FLS-PLUS.ini"
 logFile := A_ScriptDir "\FLS-PLUS.log"
 MAX_HISTORY := 20
 MAX_BOOKMARKS := 15
+MAX_PATH := 260
+MAX_DEPTH := 100
 
 ; === ИКОНКИ (Unicode символы) ===
 ICO_FOLDER    := "📁"
@@ -35,7 +37,10 @@ lastSaveFolder := ""
 alwaysOnTop := 0
 savedTabIndex := 1
 helpWindow := ""
-tabNames := ["Дерево", "Свернуть", "Развернуть", "Справка"]    ; <-- ДОБАВЛЕНО: названия вкладок для заголовка окна
+tabNames := ["Дерево", "Свернуть", "Развернуть", "Справка"]
+isCancelled := false
+operationInProgress := false
+scanInProgress := false
 
 ; Глобальные контролы для доступа из функций
 treeEdit := ""
@@ -49,6 +54,8 @@ progressUnpack := ""
 statusBar := ""
 btnAddBookmark := ""
 btnBookmarks := ""
+btnCancelPack := ""
+btnCancelUnpack := ""
 
 ; Подсказки (ToolTip)
 tooltipTexts := Map()
@@ -175,6 +182,12 @@ packControls.Push(progressPack)
 
 packControls.Push(mainGui.Add("Text", "x" (savedWidth - 110) " y90 w80 h20 vPackPercent", "0%"))
 
+; Кнопка отмены для сворачивания
+btnCancelPack := mainGui.Add("Button", "x" (savedWidth - 170) " y118 w80 h24", "Отмена")
+btnCancelPack.OnEvent("Click", CancelOperation)
+RegisterTooltip(btnCancelPack, "Отменить текущую операцию")
+packControls.Push(btnCancelPack)
+
 btnPackTab := mainGui.Add("Button", "x20 y118 w120 h32", ICO_PACK " Свернуть")
 btnPackTab.OnEvent("Click", PackProject)
 RegisterTooltip(btnPackTab, "Свернуть проект в один текстовый файл")
@@ -208,6 +221,12 @@ unpackControls.Push(progressUnpack)
 
 unpackControls.Push(mainGui.Add("Text", "x" (savedWidth - 110) " y118 w80 h20 vUnpackPercent", "0%"))
 
+; Кнопка отмены для разворачивания
+btnCancelUnpack := mainGui.Add("Button", "x" (savedWidth - 170) " y146 w80 h24", "Отмена")
+btnCancelUnpack.OnEvent("Click", CancelOperation)
+RegisterTooltip(btnCancelUnpack, "Отменить текущую операцию")
+unpackControls.Push(btnCancelUnpack)
+
 btnUnpackTab := mainGui.Add("Button", "x20 y146 w120 h32", ICO_UNPACK " Развернуть")
 btnUnpackTab.OnEvent("Click", UnpackProject)
 RegisterTooltip(btnUnpackTab, "Развернуть проект из снимка")
@@ -237,7 +256,7 @@ Hotkey "F1", ToggleHelp
 
 ; === ПОКАЗАТЬ ===
 mainGui.Show("w" savedWidth " h" savedHeight)
-mainGui.Title := APP_NAME " v" APP_VERSION " — " tabNames[savedTabIndex]    ; <-- ДОБАВЛЕНО: заголовок с активной вкладкой при старте
+mainGui.Title := APP_NAME " v" APP_VERSION " — " tabNames[savedTabIndex]
 
 ; Скрываем контролы неактивных вкладок
 TabChanged()
@@ -252,15 +271,101 @@ RegisterTooltip(ctrl, text) {
 
 CheckTooltip() {
     global tooltipTexts
+    static lastHwnd := 0
+    static hoverTimer := 0
     
-    ; Получаем HWND контрола под курсором
     MouseGetPos(,,, &controlUnderMouse, 2)
     
-    ; Проверяем, есть ли подсказка для этого контрола
-    if (tooltipTexts.Has(controlUnderMouse)) {
-        ToolTip(tooltipTexts[controlUnderMouse])
-    } else {
+    if (controlUnderMouse != lastHwnd) {
+        lastHwnd := controlUnderMouse
+        hoverTimer := A_TickCount
         ToolTip()
+    }
+    
+    if (controlUnderMouse && tooltipTexts.Has(controlUnderMouse) && (A_TickCount - hoverTimer > 500)) {
+        ToolTip(tooltipTexts[controlUnderMouse])
+    }
+}
+
+; ---------- ОТМЕНА ОПЕРАЦИЙ ----------
+CancelOperation(*) {
+    global isCancelled, statusBar
+    isCancelled := true
+    statusBar.Text := "Отмена операции..."
+}
+
+; ---------- ПОЛУЧЕНИЕ СВОБОДНОГО МЕСТА (WMI) ----------
+GetFreeSpace(drive) {
+    try {
+        driveLetter := RegExReplace(drive, "\\$")
+        objWMIService := ComObjGet("winmgmts:\\.\root\cimv2")
+        query := "SELECT FreeSpace FROM Win32_LogicalDisk WHERE DeviceID = '" driveLetter "'"
+        
+        for item in objWMIService.ExecQuery(query) {
+            return item.FreeSpace
+        }
+    } catch {
+        return 0
+    }
+    return 0
+}
+
+; ---------- АСИНХРОННОЕ СКАНИРОВАНИЕ ----------
+DoScan(folder) {
+    global treeEdit, currentTreeRaw, currentTree, ddFolderHistory, statusBar, scanInProgress
+    
+    tree := folder . "`n`n" . CreateTree(folder)
+    currentTreeRaw := tree
+    currentTree := tree
+    treeEdit.Value := tree
+    UpdateStatusBarCount(tree)
+    ddFolderHistory.Text := folder
+    statusBar.Text := "Сканирование завершено"
+    scanInProgress := false
+}
+
+; ---------- ПРОВЕРКА СВОБОДНОГО МЕСТА С ПОДТВЕРЖДЕНИЕМ ----------
+CheckFreeSpaceWithConfirm(targetFile, estimatedSize) {
+    try {
+        drive := SubStr(targetFile, 1, 3)
+        if !RegExMatch(drive, "[a-zA-Z]:\\")
+            drive := SubStr(targetFile, 1, 2)
+        
+        freeSpace := GetFreeSpace(drive)
+        freeMB := Round(freeSpace / 1024 / 1024, 2)
+        estimatedMB := Round(estimatedSize / 1024 / 1024, 2)
+        
+        if (estimatedSize = 0) {
+            result := MsgBox(
+                "ВНИМАНИЕ: Не удалось рассчитать точный размер снимка!`n`n"
+                . "Свободно на диске: " freeMB " MB`n"
+                . "Продолжить сохранение?", "Предупреждение", 52)
+            return (result = "Yes")
+        }
+        
+        if (freeSpace < estimatedSize) {
+            result := MsgBox(
+                "ВНИМАНИЕ: Недостаточно свободного места на диске " drive "!`n`n"
+                . "Свободно: " freeMB " MB`n"
+                . "Требуется: " estimatedMB " MB`n"
+                . "Не хватает: " Round((estimatedSize - freeSpace)/1024/1024, 2) " MB`n`n"
+                . "Продолжить сохранение?", "Недостаточно места", 52)
+            return (result = "Yes")
+        } else {
+            result := MsgBox(
+                "Информация о снимке:`n`n"
+                . "Предполагаемый размер: " estimatedMB " MB`n"
+                . "Свободно на диске: " freeMB " MB`n`n"
+                . "Продолжить сохранение?", "Подтверждение сохранения", 36)
+            return (result = "Yes")
+        }
+    } catch {
+        estimatedMB := Round(estimatedSize / 1024 / 1024, 2)
+        result := MsgBox(
+            "Не удалось определить свободное место на диске.`n"
+            . "Предполагаемый размер снимка: " estimatedMB " MB`n`n"
+            . "Продолжить сохранение?", "Подтверждение", 52)
+        return (result = "Yes")
     }
 }
 
@@ -351,9 +456,9 @@ ClearAllBookmarks(*) {
 
 ; ---------- ПЕРЕКЛЮЧЕНИЕ ВКЛАДОК ----------
 TabChanged(*) {
-    global tabControl, treeControls, packControls, unpackControls, helpControls, mainGui, tabNames    ; <-- ДОБАВЛЕНО: mainGui, tabNames
+    global tabControl, treeControls, packControls, unpackControls, helpControls, mainGui, tabNames
     
-    mainGui.Title := APP_NAME " v" APP_VERSION " — " tabNames[tabControl.Value]    ; <-- ДОБАВЛЕНО: обновление заголовка при смене вкладки
+    mainGui.Title := APP_NAME " v" APP_VERSION " — " tabNames[tabControl.Value]
     
     for ctrl in treeControls
         ctrl.Visible := false
@@ -380,7 +485,10 @@ TabChanged(*) {
 }
 
 ; ---------- ПОСТРОЕНИЕ ДЕРЕВА С КОДИРОВКАМИ ----------
-CreateTree(folder, indent := "", isLast := true) {
+CreateTree(folder, indent := "", isLast := true, depth := 0) {
+    if (depth > MAX_DEPTH)
+        return "... (глубина превышена)`n"
+    
     result := ""
     items := []
     
@@ -390,7 +498,7 @@ CreateTree(folder, indent := "", isLast := true) {
             items.Push(A_LoopFileFullPath)
         }
     } catch {
-        return ""
+        return "[Доступ запрещён]`n"
     }
     
     dirs := []
@@ -435,7 +543,7 @@ CreateTree(folder, indent := "", isLast := true) {
             } else {
                 newIndent := indent . (isLastItem ? "    " : "│   ")
             }
-            result .= CreateTree(item.Path, newIndent, isLastItem)
+            result .= CreateTree(item.Path, newIndent, isLastItem, depth + 1)
         }
     }
     
@@ -518,6 +626,48 @@ IsValidUTF8Strict(buffer) {
     return true
 }
 
+; ---------- ПРОВЕРКА БЕЗОПАСНОСТИ ПУТЕЙ ----------
+IsValidPath(path) {
+    if (path = "")
+        return false
+    
+    if (StrLen(path) > MAX_PATH)
+        return false
+    
+    Loop Parse, path
+    {
+        charCode := Ord(A_LoopField)
+        if (charCode = 60 || charCode = 62 || charCode = 58 || charCode = 34 || charCode = 124 || charCode = 63 || charCode = 42)
+            return false
+    }
+    
+    if (!RegExMatch(path, "^[a-zA-Z]:\\") && !RegExMatch(path, "^\\\\"))
+        return false
+    
+    return true
+}
+
+SafeOpenExplorer(folderPath) {
+    if (!IsValidPath(folderPath)) {
+        MsgBox("Некорректный путь: " folderPath, "Ошибка", 48)
+        return false
+    }
+    
+    if !DirExist(folderPath) {
+        MsgBox("Папка не существует: " folderPath, "Ошибка", 48)
+        return false
+    }
+    
+    safePath := StrReplace(folderPath, "&", "^&")
+    safePath := StrReplace(safePath, "|", "^|")
+    safePath := StrReplace(safePath, "!", "^!")
+    safePath := StrReplace(safePath, "^", "^^")
+    safePath := StrReplace(safePath, "`"", "'")
+    
+    Run('explorer.exe "' safePath '"',, "Hide")
+    return true
+}
+
 ; ---------- СОРТИРОВКА ----------
 SortArray(arr) {
     if (arr.Length <= 1)
@@ -550,12 +700,16 @@ ReadFileWithEncoding(filePath, encoding) {
 
 ; ---------- СОХРАНЕНИЕ ФАЙЛА В ОРИГИНАЛЬНОЙ КОДИРОВКЕ ----------
 SaveUnpackedFile(baseFolder, relPath, content, encoding) {
+    fullPath := baseFolder "\" relPath
+    
+    if (StrLen(fullPath) > MAX_PATH)
+        return
+    
     if (SubStr(content, -1) = "`n")
         content := SubStr(content, 1, -1)
     if (SubStr(content, -1) = "`r")
         content := SubStr(content, 1, -1)
     
-    fullPath := baseFolder "\" relPath
     dir := RegExReplace(fullPath, "\\[^\\]+$", "")
     if (dir != "" && !DirExist(dir))
         DirCreate(dir)
@@ -567,31 +721,37 @@ SaveUnpackedFile(baseFolder, relPath, content, encoding) {
     }
 }
 
-; ---------- СКАНИРОВАНИЕ ----------
+; ---------- СКАНИРОВАНИЕ (АСИНХРОННОЕ) ----------
 ScanFolder(*) {
-    global lastFolder, statusBar, treeEdit, currentTreeRaw, currentTree, ddFolderHistory
+    global lastFolder, statusBar, treeEdit, scanInProgress
     if (lastFolder = "" || !DirExist(lastFolder)) {
         MsgBox("Нет сохранённой папки. Нажмите 'Обзор' для выбора.", "Внимание", 48)
         return
     }
     
-    statusBar.Text := "Сканирование: " lastFolder
-    tree := lastFolder . "`n" . CreateTree(lastFolder)
-    currentTreeRaw := tree
-    currentTree := tree
-    treeEdit.Value := tree
-    UpdateStatusBarCount(tree)
+    if (scanInProgress) {
+        MsgBox("Сканирование уже выполняется. Подождите.", "Внимание", 48)
+        return
+    }
     
-    ddFolderHistory.Text := lastFolder
+    scanInProgress := true
+    statusBar.Text := "Сканирование: " lastFolder
+    treeEdit.Value := "Сканирование... (это может занять некоторое время)"
+    
+    SetTimer(() => DoScan(lastFolder), -10)
 }
 
 BrowseFolder(*) {
-    global lastBrowseFolder, lastFolder, statusBar, treeEdit, currentTreeRaw, currentTree, ddFolderHistory, folderHistory
+    global lastFolder, statusBar, ddFolderHistory, folderHistory, scanInProgress, treeEdit
     selectedFolder := DirSelect("", 3, "Выберите папку для отображения")
     if (selectedFolder = "")
         return
     
-    lastBrowseFolder := selectedFolder
+    if (scanInProgress) {
+        MsgBox("Сканирование уже выполняется. Подождите.", "Внимание", 48)
+        return
+    }
+    
     lastFolder := selectedFolder
     folderHistory := AddToHistory(folderHistory, selectedFolder)
     ddFolderHistory.Delete()
@@ -600,15 +760,14 @@ BrowseFolder(*) {
     ddFolderHistory.Text := selectedFolder
     SaveSettings()
     
+    scanInProgress := true
     statusBar.Text := "Сканирование: " selectedFolder
-    tree := selectedFolder . "`n" . CreateTree(selectedFolder)
-    currentTreeRaw := tree
-    currentTree := tree
-    treeEdit.Value := tree
-    UpdateStatusBarCount(tree)
+    treeEdit.Value := "Сканирование... (это может занять некоторое время)"
+    
+    SetTimer(() => DoScan(selectedFolder), -10)
 }
 
-; ---------- СВОРАЧИВАНИЕ ----------
+; ---------- СВОРАЧИВАНИЕ С ПРОВЕРКОЙ МЕСТА ----------
 SelectPackFile(*) {
     global lastFolder, ddFileHistory, fileHistory
     startFolder := lastFolder != "" ? lastFolder : A_Desktop
@@ -627,14 +786,72 @@ SelectPackFile(*) {
 
 PackProject(*) {
     global currentTree, statusBar, progressPack, mainGui, fileHistory, ddFileHistory
+    global isCancelled, operationInProgress
+    
+    if (operationInProgress) {
+        MsgBox("Операция уже выполняется. Подождите или нажмите Отмена.", "Внимание", 48)
+        return
+    }
+    
     if (currentTree = "") {
-        MsgBox("Нет дерева для сворачивания.", "Ошибка", 48)
+        MsgBox("Нет дерева для сворачивания. Сначала выберите папку.", "Ошибка", 48)
         return
     }
     
     targetFile := ddFileHistory.Text
     if (targetFile = "") {
         MsgBox("Выберите целевой файл.", "Ошибка", 48)
+        return
+    }
+    
+    statusBar.Text := "Расчёт размера снимка..."
+    progressPack.Value := 0
+    mainGui["PackPercent"].Text := "0%"
+    
+    lines := StrSplit(RTrim(currentTree, "`n"), "`n")
+    rootFolder := Trim(lines[1])
+    if (SubStr(rootFolder, -1) = "\")
+        rootFolder := SubStr(rootFolder, 1, -1)
+    
+    files := CollectFilesFromTree(currentTree, rootFolder)
+    totalFiles := files.Length
+    
+    if (totalFiles = 0) {
+        MsgBox("Не найдено файлов для сохранения!", "Ошибка", 48)
+        return
+    }
+    
+    estimatedSize := 0
+    for index, filePath in files {
+        if (isCancelled) {
+            statusBar.Text := "Расчёт отменён"
+            return
+        }
+        
+        try {
+            fileSize := FileGetSize(filePath)
+            estimatedSize += fileSize
+            estimatedSize += 200
+        } catch {
+            continue
+        }
+        
+        if (Mod(index, 20) = 0) {
+            percent := Round((index / totalFiles) * 100)
+            progressPack.Value := percent
+            mainGui["PackPercent"].Text := percent "%"
+            statusBar.Text := "Расчёт размера: " percent "% (" index "/" totalFiles ")"
+        }
+    }
+    
+    progressPack.Value := 100
+    mainGui["PackPercent"].Text := "100%"
+    
+    if !CheckFreeSpaceWithConfirm(targetFile, estimatedSize) {
+        statusBar.Text := "Сохранение отменено пользователем"
+        progressPack.Value := 0
+        mainGui["PackPercent"].Text := "0%"
+        SetTimer(() => (progressPack.Value := 0, mainGui["PackPercent"].Text := "0%"), -2000)
         return
     }
     
@@ -647,25 +864,48 @@ PackProject(*) {
     statusBar.Text := "Сворачивание..."
     progressPack.Value := 0
     mainGui["PackPercent"].Text := "0%"
+    operationInProgress := true
+    isCancelled := false
     
     try {
-        packedContent := PackFolder(currentTree, progressPack)
-        if FileExist(targetFile)
-            FileDelete(targetFile)
-        FileAppend(packedContent, targetFile, "UTF-8")
-        progressPack.Value := 100
-        mainGui["PackPercent"].Text := "100%"
-        statusBar.Text := "Снимок сохранён: " targetFile
-        MsgBox("Снимок успешно создан!", APP_NAME, 64)
+        DirectPackToFile(currentTree, targetFile, progressPack)
+        if (!isCancelled) {
+            progressPack.Value := 100
+            mainGui["PackPercent"].Text := "100%"
+            
+            if FileExist(targetFile) {
+                actualSize := FileGetSize(targetFile)
+                actualMB := Round(actualSize / 1024 / 1024, 2)
+                estimatedMB := Round(estimatedSize / 1024 / 1024, 2)
+                
+                statusBar.Text := "Снимок сохранён: " targetFile " (" actualMB " MB)"
+                MsgBox("Снимок успешно создан!`n`n"
+                       . "Файл: " targetFile "`n"
+                       . "Размер: " actualMB " MB`n"
+                       . "Расчётный размер: " estimatedMB " MB`n"
+                       . "Файлов: " totalFiles, APP_NAME, 64)
+            } else {
+                statusBar.Text := "Снимок сохранён: " targetFile
+                MsgBox("Снимок успешно создан!", APP_NAME, 64)
+            }
+        }
     } catch as e {
         MsgBox("Ошибка: " e.Message, "Ошибка", 48)
     } finally {
+        operationInProgress := false
         SetTimer(() => (progressPack.Value := 0, mainGui["PackPercent"].Text := "0%"), -3000)
     }
 }
 
-PackFolder(treeText, progressCtrl := "") {
-    result := treeText . "`n`n"
+DirectPackToFile(treeText, targetFile, progressCtrl := "") {
+    global isCancelled, mainGui, statusBar
+    
+    if FileExist(targetFile)
+        FileDelete(targetFile)
+    
+    header := treeText . "`n`n"
+    FileAppend(header, targetFile, "UTF-8")
+    
     lines := StrSplit(RTrim(treeText, "`n"), "`n")
     
     rootFolder := Trim(lines[1])
@@ -676,9 +916,17 @@ PackFolder(treeText, progressCtrl := "") {
     totalFiles := files.Length
     
     if (totalFiles = 0)
-        return result
+        return
     
     for index, filePath in files {
+        if (isCancelled) {
+            statusBar.Text := "Операция отменена пользователем"
+            SetTimer(() => (statusBar.Text := "Готово"), -2000)
+            if FileExist(targetFile)
+                FileDelete(targetFile)
+            return
+        }
+        
         relPath := StrReplace(filePath, rootFolder "\", "")
         encoding := DetectEncoding(filePath)
         if (encoding = "")
@@ -688,11 +936,13 @@ PackFolder(treeText, progressCtrl := "") {
         if (fileContent = "")
             continue
         
-        result .= "=== " relPath " | " encoding " ===`n"
-        result .= fileContent
+        section := "=== " relPath " | " encoding " ===`n"
+        section .= fileContent
         if (SubStr(fileContent, -1) != "`n")
-            result .= "`n"
-        result .= "`n"
+            section .= "`n"
+        section .= "`n"
+        
+        FileAppend(section, targetFile, "UTF-8")
         
         if (IsObject(progressCtrl)) {
             percent := Round((index / totalFiles) * 100)
@@ -700,8 +950,6 @@ PackFolder(treeText, progressCtrl := "") {
             mainGui["PackPercent"].Text := percent "%"
         }
     }
-    
-    return result
 }
 
 ; ---------- РАЗВОРАЧИВАНИЕ ----------
@@ -735,6 +983,13 @@ SelectTargetFolder(*) {
 
 UnpackProject(*) {
     global ddSnapshotHistory, ddTargetFolder, statusBar, progressUnpack, mainGui
+    global isCancelled, operationInProgress
+    
+    if (operationInProgress) {
+        MsgBox("Операция уже выполняется. Подождите или нажмите Отмена.", "Внимание", 48)
+        return
+    }
+    
     snapshotFile := ddSnapshotHistory.Text
     targetFolder := ddTargetFolder.Text
     
@@ -747,24 +1002,70 @@ UnpackProject(*) {
         return
     }
     
+    drive := SubStr(targetFolder, 1, 3)
+    if !RegExMatch(drive, "[a-zA-Z]:\\")
+        drive := SubStr(targetFolder, 1, 2)
+    
+    try {
+        freeSpace := GetFreeSpace(drive)
+        freeMB := freeSpace / 1024 / 1024
+        
+        snapshotSize := FileGetSize(snapshotFile)
+        snapshotMB := snapshotSize / 1024 / 1024
+        
+        if (freeSpace < snapshotSize * 2) {
+            result := MsgBox(
+                "ВНИМАНИЕ: На диске " drive " может не хватить места для разворачивания!`n`n"
+                . "Свободно: " Round(freeMB, 1) " MB`n"
+                . "Размер снимка: " Round(snapshotMB, 1) " MB`n"
+                . "Требуется примерно: " Round(snapshotMB * 2, 1) " MB`n`n"
+                . "Продолжить разворачивание?", "Недостаточно места", 52)
+            if (result != "Yes")
+                return
+        } else {
+            result := MsgBox(
+                "Информация о разворачивании:`n`n"
+                . "Размер снимка: " Round(snapshotMB, 1) " MB`n"
+                . "Свободно на диске: " Round(freeMB, 1) " MB`n`n"
+                . "Продолжить разворачивание?", "Подтверждение", 36)
+            if (result != "Yes")
+                return
+        }
+    } catch {
+        snapshotSize := FileGetSize(snapshotFile)
+        result := MsgBox(
+            "Не удалось проверить свободное место.`n"
+            . "Размер снимка: " Round(snapshotSize/1024/1024, 1) " MB`n`n"
+            . "Продолжить разворачивание?", "Подтверждение", 52)
+        if (result != "Yes")
+            return
+    }
+    
     statusBar.Text := "Разворачивание..."
     progressUnpack.Value := 0
     mainGui["UnpackPercent"].Text := "0%"
+    operationInProgress := true
+    isCancelled := false
     
     try {
         UnpackSnapshot(snapshotFile, targetFolder, progressUnpack)
-        progressUnpack.Value := 100
-        mainGui["UnpackPercent"].Text := "100%"
-        statusBar.Text := "Проект развёрнут в: " targetFolder
-        MsgBox("Проект успешно развёрнут!", APP_NAME, 64)
+        if (!isCancelled) {
+            progressUnpack.Value := 100
+            mainGui["UnpackPercent"].Text := "100%"
+            statusBar.Text := "Проект развёрнут в: " targetFolder
+            MsgBox("Проект успешно развёрнут!", APP_NAME, 64)
+        }
     } catch as e {
         MsgBox("Ошибка: " e.Message, "Ошибка", 48)
     } finally {
+        operationInProgress := false
         SetTimer(() => (progressUnpack.Value := 0, mainGui["UnpackPercent"].Text := "0%"), -3000)
     }
 }
 
 UnpackSnapshot(snapshotFile, targetFolder, progressCtrl := "") {
+    global isCancelled, mainGui, statusBar
+    
     content := FileRead(snapshotFile, "UTF-8")
     lines := StrSplit(content, "`n")
     
@@ -782,6 +1083,12 @@ UnpackSnapshot(snapshotFile, targetFolder, progressCtrl := "") {
     processedFiles := 0
     
     for line in lines {
+        if (isCancelled) {
+            statusBar.Text := "Операция отменена пользователем"
+            SetTimer(() => (statusBar.Text := "Готово"), -2000)
+            return
+        }
+        
         if RegExMatch(line, "^=== (.+) \| (utf-8|cp1251) ===$", &match) {
             if (inFile && currentFile != "") {
                 SaveUnpackedFile(targetFolder, currentFile, fileContent, currentEncoding)
@@ -804,7 +1111,7 @@ UnpackSnapshot(snapshotFile, targetFolder, progressCtrl := "") {
         }
     }
     
-    if (inFile && currentFile != "") {
+    if (inFile && currentFile != "" && !isCancelled) {
         SaveUnpackedFile(targetFolder, currentFile, fileContent, currentEncoding)
         processedFiles++
         if (IsObject(progressCtrl)) {
@@ -861,6 +1168,11 @@ CollectFilesFromTree(treeText, rootFolder) {
             for part in pathParts
                 fullPath .= "\" . part
             fullPath .= "\" . clean
+            
+            if (StrLen(fullPath) > MAX_PATH) {
+                i++
+                continue
+            }
             
             if (FileExist(fullPath) && !InStr(FileExist(fullPath), "D"))
                 files.Push(fullPath)
@@ -935,7 +1247,7 @@ SaveTree(*) {
     SaveSettings()
     
     try {
-        FileAppend(text, file, "UTF-8-RAW")
+        FileAppend(text, file, "UTF-8")
         statusBar.Text := "Сохранено: " file
         SetTimer(() => UpdateStatusBarCount(treeEdit.Value), -2000)
     } catch as e {
@@ -954,8 +1266,9 @@ ClearTree(*) {
 OpenExplorer(*) {
     global lastFolder, statusBar
     if (lastFolder != "" && DirExist(lastFolder)) {
-        Run("explorer.exe `"" lastFolder "`"")
-        statusBar.Text := "Открыт проводник"
+        if (SafeOpenExplorer(lastFolder)) {
+            statusBar.Text := "Открыт проводник"
+        }
     } else {
         MsgBox("Нет выбранной папки.", "Ошибка", 48)
     }
@@ -982,10 +1295,10 @@ ToggleHelp(*) {
 ShowHelpWindow() {
     global helpWindow, APP_NAME, APP_VERSION
     
-    helpGui := Gui("+Resize +MinSize400x300", APP_NAME " — Справка")
+    helpGui := Gui("+Resize +MinSize400x300", APP_NAME " — Справка v" APP_VERSION)
     helpGui.SetFont("s10", "Segoe UI")
     
-    tab := helpGui.Add("Tab3", "x10 y10 w580 h440", ["О программе", "Автор", "Лицензия", "Руководство"])
+    tab := helpGui.Add("Tab3", "x10 y10 w580 h440", ["О программе", "Что нового", "Автор", "Лицензия", "Руководство"])
     
     ; О программе
     tab.UseTab(1)
@@ -1007,30 +1320,66 @@ ShowHelpWindow() {
         . "• История папок и файлов (выпадающие списки)`n"
         . "• Закладки избранных папок`n"
         . "• Прогресс-бар при операциях`n"
-        . "• Всплывающие подсказки на кнопках`n`n"
+        . "• Всплывающие подсказки на кнопках`n"
+        . "• Отмена длительных операций`n"
+        . "• Асинхронное сканирование (UI не зависает)`n"
+        . "• Предварительный расчёт размера снимка`n"
+        . "• Проверка свободного места на диске`n"
+        . "• Защита от глубокой рекурсии (макс. " MAX_DEPTH " уровней)`n"
+        . "• Защита от одновременных операций`n`n"
         . "Формат снимка:`n"
         . "=== путь/к/файлу | кодировка ===`n"
         . "содержимое файла`n`n"
         . "Кодировки в снимке: utf-8, cp1251"
     
-    ; Автор
+    ; Что нового (v1.1)
     tab.UseTab(2)
     txt2 := helpGui.Add("Edit", "x20 y40 w560 h400 ReadOnly")
     txt2.SetFont("s10", "Consolas")
     txt2.Opt("+BackgroundFFFFFF -E0x200")
-    txt2.Value := "Разработчик: IgerOK`n"
-        . "GitHub: https://github.com/IgerOK/FLS-PLUS`n"
-        . "Год: 2026`n`n"
-        . "Благодарности:`n"
-        . "• Сообществу AutoHotkey`n"
-        . "• Пользователям за обратную связь"
+    txt2.Value := "Версия 1.1 (2026)`n`n"
+        . "НОВОВВЕДЕНИЯ:`n"
+        . "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`n"
+        . "• Асинхронное сканирование — интерфейс не зависает при сканировании больших папок`n"
+        . "• Предварительный расчёт размера снимка перед сохранением`n"
+        . "• Проверка свободного места на диске с подтверждением`n"
+        . "• Отмена длительных операций (кнопка 'Отмена')`n"
+        . "• Всплывающие подсказки с задержкой 500 мс`n"
+        . "• Защита от глубокой рекурсии (макс. " MAX_DEPTH " уровней)`n"
+        . "• Защита от одновременных операций`n"
+        . "• Сохранение размера окна и активной вкладки`n"
+        . "• Изменение заголовка окна при смене вкладки`n"
+        . "• Безопасное экранирование спецсимволов в путях`n`n"
+        . "ИСПРАВЛЕНИЯ ОШИБОК:`n"
+        . "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`n"
+        . "• Устранены утечки памяти при сворачивании больших проектов`n"
+        . "• Исправлено мерцание всплывающих подсказок`n"
+        . "• Исправлена ошибка с длинными путями (MAX_PATH)`n"
+        . "• Корректное определение кодировки файлов`n`n"
+        . "СОВМЕСТИМОСТЬ:`n"
+        . "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`n"
+        . "• AutoHotkey v2.0+`n"
+        . "• Windows 7 / 8 / 10 / 11"
     
-    ; Лицензия
+    ; Автор
     tab.UseTab(3)
     txt3 := helpGui.Add("Edit", "x20 y40 w560 h400 ReadOnly")
     txt3.SetFont("s10", "Consolas")
     txt3.Opt("+BackgroundFFFFFF -E0x200")
-    txt3.Value := "MIT License`n`n"
+    txt3.Value := "Разработчик: IgerOK`n"
+        . "GitHub: https://github.com/IgerOK/FLS-PLUS`n"
+        . "Год: 2026`n`n"
+        . "Благодарности:`n"
+        . "• Сообществу AutoHotkey`n"
+        . "• Всем пользователям за обратную связь и сообщения об ошибках`n`n"
+        . "Если вам понравилась программа, поставьте звёздочку на GitHub!"
+    
+    ; Лицензия
+    tab.UseTab(4)
+    txt4 := helpGui.Add("Edit", "x20 y40 w560 h400 ReadOnly")
+    txt4.SetFont("s10", "Consolas")
+    txt4.Opt("+BackgroundFFFFFF -E0x200")
+    txt4.Value := "MIT License`n`n"
         . "Copyright (c) 2026 IgerOK`n`n"
         . "Permission is hereby granted, free of charge, to any person obtaining a copy`n"
         . "of this software and associated documentation files (the `"Software`"), to deal`n"
@@ -1049,38 +1398,37 @@ ShowHelpWindow() {
         . "SOFTWARE."
     
     ; Руководство
-    tab.UseTab(4)
-    txt4 := helpGui.Add("Edit", "x20 y40 w560 h400 ReadOnly")
-    txt4.SetFont("s10", "Consolas")
-    txt4.Opt("+BackgroundFFFFFF -E0x200")
-    txt4.Value := "БЫСТРЫЙ СТАРТ`n`n"
+    tab.UseTab(5)
+    txt5 := helpGui.Add("Edit", "x20 y40 w560 h400 ReadOnly")
+    txt5.SetFont("s10", "Consolas")
+    txt5.Opt("+BackgroundFFFFFF -E0x200")
+    txt5.Value := "БЫСТРЫЙ СТАРТ`n`n"
         . "1. Выберите папку (Обзор или выпадающий список истории)`n"
-        . "2. Дерево построится автоматически с кодировками`n"
+        . "2. Дерево построится автоматически (асинхронно, UI не зависает)`n"
         . "3. Перейдите на вкладку 'Свернуть'`n"
-        . "4. Выберите файл и нажмите 'Свернуть'`n`n"
+        . "4. Нажмите 'Свернуть' - программа рассчитает размер и проверит место`n"
+        . "5. Подтвердите сохранение`n`n"
         . "Для разворачивания:`n"
         . "1. Перейдите на вкладку 'Развернуть'`n"
         . "2. Выберите файл-снимок и целевую папку`n"
         . "3. Нажмите 'Развернуть'`n`n"
-        . "ЗАГОЛОВОК ОКНА:`n"
-        . "При переключении вкладок заголовок окна меняется:`n"
-        . "FLS-PLUS v1.0 — Дерево, FLS-PLUS v1.0 — Свернуть и т.д.`n"
-        . "Это помогает видеть текущую вкладку в панели задач.`n`n"
-        . "ГОРЯЧИЕ КЛАВИШИ:`n"
-        . "F1 — Справка`n`n"
-        . "В окнах программы работают стандартные сочетания Windows:`n"
-        . "Ctrl+A — выделить всё`n"
-        . "Ctrl+C — копировать выделенное`n"
-        . "Ctrl+Home / Ctrl+End — в начало / конец текста`n"
-        . "Page Up / Page Down — прокрутка на страницу`n`n"
+        . "ПРОВЕРКА МЕСТА:`n"
+        . "Перед сохранением программа показывает предполагаемый размер снимка`n"
+        . "и свободное место на диске, запрашивая подтверждение.`n`n"
+        . "ОТМЕНА ОПЕРАЦИЙ:`n"
+        . "Во время сворачивания или разворачивания нажмите кнопку 'Отмена'`n"
+        . "Операция остановится, а неполный файл будет удалён.`n`n"
+        . "АСИНХРОННОЕ СКАНИРОВАНИЕ:`n"
+        . "При сканировании больших папок интерфейс не зависает.`n"
+        . "В окне отображается сообщение 'Сканирование...'`n"
+        . "После завершения дерево отображается автоматически.`n`n"
         . "ЗАКЛАДКИ:`n"
         . "• " ICO_ADD_BM " — добавить текущую папку в закладки`n"
         . "• " ICO_BOOKMARK " — открыть меню закладок`n`n"
-        . "ПОДСКАЗКИ:`n"
-        . "При наведении на кнопки появляются всплывающие подсказки`n`n"
-        . "Формат снимка:`n"
-        . "=== путь/к/файлу | utf-8 ===`n"
-        . "=== путь/к/файлу | cp1251 ===`n`n"
+        . "ГОРЯЧИЕ КЛАВИШИ:`n"
+        . "F1 — Справка`n`n"
+        . "Поддерживаемые кодировки: UTF-8, CP1251`n`n"
+        . "Все настройки сохраняются в файле FLS-PLUS.ini"
     
     tab.UseTab()
     helpGui.Add("Button", "x250 y460 w100", "Закрыть").OnEvent("Click", (*) => helpGui.Destroy())
@@ -1091,7 +1439,8 @@ ShowHelpWindow() {
 }
 
 GetHelpText() {
-    return "Нажмите F1 для открытия справки.`n`n"
+    return "FLS-PLUS v" APP_VERSION "`n`n"
+        . "Нажмите F1 для открытия подробной справки.`n`n"
         . "Кнопки:`n"
         . ICO_FOLDER " Обзор — выбор новой папки`n"
         . ICO_OPEN " Открыть — повторное сканирование`n"
@@ -1102,23 +1451,19 @@ GetHelpText() {
         . ICO_ADD_BM " — добавить в закладки`n"
         . ICO_BOOKMARK " — меню закладок`n`n"
         . "Вкладки:`n"
-        . "Дерево — просмотр структуры`n"
+        . "Дерево — просмотр структуры (асинхронно)`n"
         . "Свернуть — сохранить проект в снимок`n"
         . "Развернуть — восстановить из снимка`n"
         . "Справка — информация о программе`n`n"
-        . "Заголовок окна:`n"
-        . "При переключении вкладок заголовок окна меняется:`n"
-        . "FLS-PLUS v1.0 — Дерево, FLS-PLUS v1.0 — Свернуть и т.д.`n"
-        . "Это помогает видеть текущую вкладку даже при свёрнутом окне.`n`n"
-        . "ГОРЯЧИЕ КЛАВИШИ:`n"
-        . "F1 — Справка`n`n"
-        . "В окнах программы работают стандартные сочетания Windows:`n"
-        . "Ctrl+A — выделить всё`n"
-        . "Ctrl+C — копировать выделенное`n"
-        . "Ctrl+Home / Ctrl+End — в начало / конец текста`n"
-        . "Page Up / Page Down — прокрутка на страницу`n`n"
-        . "Поддерживаемые кодировки: UTF-8, CP1251`n`n"
-        . "Подсказки: при наведении на кнопки появляются подсказки"
+        . "Проверка места: перед сохранением показывается размер снимка`n`n"
+        . "Что нового в v1.1:`n"
+        . "• Асинхронное сканирование — UI не зависает`n"
+        . "• Расчёт размера снимка перед сохранением`n"
+        . "• Проверка свободного места на диске`n"
+        . "• Отмена длительных операций`n"
+        . "• Всплывающие подсказки с задержкой`n`n"
+        . "Отмена: кнопка 'Отмена' во время операций`n`n"
+        . "ГОРЯЧИЕ КЛАВИШИ: F1 — Справка"
 }
 
 ; ---------- НАСТРОЙКИ ----------
@@ -1202,8 +1547,8 @@ GuiSizeChanged(gui, minMax, w, h) {
         return
     
     global tabControl, treeEdit, helpEdit, statusBar
-    global snapshotFileEdit, targetFolderEdit
     global btnSelectPackFile, btnSelectSnapshot, btnSelectTargetFolder
+    global btnCancelPack, btnCancelUnpack
     global chkOnTop, ddFolderHistory, ddFileHistory, ddSnapshotHistory, ddTargetFolder
     global btnAddBookmark, btnBookmarks, progressPack, progressUnpack
     global btnBrowseTree, btnScanTree, btnExplorerTree, btnCopyTree, btnSaveTree, btnClearTree
@@ -1223,6 +1568,7 @@ GuiSizeChanged(gui, minMax, w, h) {
     btnSelectPackFile.Move(w - 170, 56)
     progressPack.Move(80, 90, w - 200)
     mainGui["PackPercent"].Move(w - 110, 90)
+    btnCancelPack.Move(w - 170, 118)
     btnPackTab.Move(20, 118)
     
     ddSnapshotHistory.Move(80, 58, w - 260)
@@ -1231,6 +1577,7 @@ GuiSizeChanged(gui, minMax, w, h) {
     btnSelectTargetFolder.Move(w - 170, 84)
     progressUnpack.Move(80, 118, w - 200)
     mainGui["UnpackPercent"].Move(w - 110, 118)
+    btnCancelUnpack.Move(w - 170, 146)
     btnUnpackTab.Move(20, 146)
     
     helpEdit.Move(20, 60, w - 50, h - 90)
